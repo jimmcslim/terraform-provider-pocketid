@@ -102,7 +102,7 @@ signs:
 # Release configuration
 release:
   github:
-    owner: Trozz
+    owner: jimmcslim
     name: terraform-provider-pocketid
 
   extra_files:
