@@ -5,6 +5,8 @@ package provider_test
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -12,7 +14,9 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
 func TestAccResourceClient_basic(t *testing.T) {
@@ -762,6 +766,191 @@ func TestAccResourceClient_secretRotationRevokesPrevious(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestAccResourceClient_secretWriteOnly checks the client_secret_wo flow:
+// the supplied secret is sent to Pocket ID, only client_secret_id lands in
+// state, and client_secret_wo_version is the sole rotation trigger.
+func TestAccResourceClient_secretWriteOnly(t *testing.T) {
+	resourceName := "pocketid_client.test"
+	initialSecret := "wo-initial-0123456789abcdef"
+	sameVersionSecret := "wo-ignored-0123456789abcdef"
+	rotatedSecret := "wo-rotated-abcdef0123456789"
+
+	var clientID, firstSecretID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		// Write-only attributes need Terraform 1.11 or later.
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.SkipBelow(tfversion.Version1_11_0),
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: testAccResourceClientConfig_secretWO("wo-client", initialSecret, 1),
+				ConfigStateChecks: []statecheck.StateCheck{
+					stateExcludes(initialSecret, sameVersionSecret, rotatedSecret),
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(resourceName, "client_secret"),
+					resource.TestCheckNoResourceAttr(resourceName, "client_secret_wo"),
+					resource.TestCheckResourceAttr(resourceName, "client_secret_wo_version", "1"),
+					resource.TestCheckResourceAttrWith(resourceName, "id", func(v string) error {
+						clientID = v
+						return nil
+					}),
+					resource.TestCheckResourceAttrWith(resourceName, "client_secret_id", func(v string) error {
+						if v == "" {
+							return fmt.Errorf("client_secret_id is empty")
+						}
+						firstSecretID = v
+						return nil
+					}),
+					// Only the supplied secret may be valid, not an auto-created one.
+					func(*terraform.State) error {
+						return checkClientSecretCount(clientID, 1)
+					},
+				),
+			},
+			{
+				// A new value under the same version is not a rotation.
+				Config: testAccResourceClientConfig_secretWO("wo-client", sameVersionSecret, 1),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectEmptyPlan(),
+					},
+				},
+			},
+			{
+				Config: testAccResourceClientConfig_secretWO("wo-client", rotatedSecret, 2),
+				ConfigStateChecks: []statecheck.StateCheck{
+					stateExcludes(initialSecret, sameVersionSecret, rotatedSecret),
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "client_secret_wo_version", "2"),
+					resource.TestCheckResourceAttrWith(resourceName, "client_secret_id", func(v string) error {
+						if v == firstSecretID {
+							return fmt.Errorf("client_secret_id did not change after rotation")
+						}
+						return nil
+					}),
+					func(*terraform.State) error {
+						if err := checkClientSecretCount(clientID, 1); err != nil {
+							return err
+						}
+						return checkClientSecretAbsent(clientID, firstSecretID)
+					},
+				),
+			},
+			{
+				// Neither write-only attribute is set by an import.
+				ResourceName:            resourceName,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"client_secret", "client_secret_wo_version"},
+			},
+		},
+	})
+}
+
+// TestAccResourceClient_secretWriteOnlyConflicts checks the configuration
+// rules around client_secret_wo.
+func TestAccResourceClient_secretWriteOnlyConflicts(t *testing.T) {
+	cases := map[string]struct {
+		attrs  string
+		errMsg string
+	}{
+		"with client_secret": {
+			attrs:  `client_secret = "conflict-0123456789abcdef"`,
+			errMsg: "cannot be set together with client_secret",
+		},
+		"public client": {
+			attrs:  `is_public = true`,
+			errMsg: "can only be set for confidential clients",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			resource.Test(t, resource.TestCase{
+				PreCheck:                 func() { testAccPreCheck(t) },
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+					tfversion.SkipBelow(tfversion.Version1_11_0),
+				},
+				Steps: []resource.TestStep{
+					{
+						Config: testAccProviderConfig() + fmt.Sprintf(`
+resource "pocketid_client" "test" {
+  name                     = "wo-conflict"
+  callback_urls            = ["https://example.com/callback"]
+  client_secret_wo         = "wo-conflict-0123456789abcdef"
+  client_secret_wo_version = 1
+  %s
+}
+`, tc.attrs),
+						ExpectError: regexp.MustCompile(tc.errMsg),
+					},
+				},
+			})
+		})
+	}
+
+	t.Run("version without secret", func(t *testing.T) {
+		resource.Test(t, resource.TestCase{
+			PreCheck:                 func() { testAccPreCheck(t) },
+			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+			TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+				tfversion.SkipBelow(tfversion.Version1_11_0),
+			},
+			Steps: []resource.TestStep{
+				{
+					Config: testAccProviderConfig() + `
+resource "pocketid_client" "test" {
+  name                     = "wo-version-only"
+  callback_urls            = ["https://example.com/callback"]
+  client_secret_wo_version = 1
+}
+`,
+					ExpectError: regexp.MustCompile("requires client_secret_wo"),
+				},
+			},
+		})
+	})
+}
+
+// stateExcludes fails when the serialized state contains any of the given values.
+func stateExcludes(values ...string) statecheck.StateCheck {
+	return stateExcludesCheck{values: values}
+}
+
+type stateExcludesCheck struct{ values []string }
+
+func (c stateExcludesCheck) CheckState(_ context.Context, req statecheck.CheckStateRequest, resp *statecheck.CheckStateResponse) {
+	raw, err := json.Marshal(req.State)
+	if err != nil {
+		resp.Error = err
+		return
+	}
+	for _, v := range c.values {
+		if bytes.Contains(raw, []byte(v)) {
+			resp.Error = fmt.Errorf("state contains a client secret value")
+			return
+		}
+	}
+}
+
+func testAccResourceClientConfig_secretWO(name, secret string, version int) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "pocketid_client" "test" {
+  name                     = %[1]q
+  callback_urls            = ["https://example.com/callback"]
+  is_public                = false
+  client_secret_wo         = %[2]q
+  client_secret_wo_version = %[3]d
+}
+`, name, secret, version)
 }
 
 // testAccResourceClientConfig_logoURLs renders a client with the given logo

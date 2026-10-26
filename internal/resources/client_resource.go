@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -29,6 +30,7 @@ var (
 	_ resource.ResourceWithConfigure      = &clientResource{}
 	_ resource.ResourceWithImportState    = &clientResource{}
 	_ resource.ResourceWithValidateConfig = &clientResource{}
+	_ resource.ResourceWithModifyPlan     = &clientResource{}
 )
 
 // NewClientResource is a helper function to simplify the provider implementation.
@@ -43,14 +45,14 @@ type clientResource struct {
 
 // clientResourceModel maps the resource schema data.
 // clientSecretIDPlanModifier keeps client_secret_id at its prior value unless
-// client_secret is actually changing. A rotation creates a new secret, so its
+// client_secret or client_secret_wo is actually changing. A rotation creates a new secret, so its
 // id is only known after apply; using the prior value there would make the
 // applied result differ from the plan. Keeping the prior value in every other
 // case avoids a spurious "known after apply" diff on unrelated updates.
 type clientSecretIDPlanModifier struct{}
 
 func (m clientSecretIDPlanModifier) Description(context.Context) string {
-	return "Keeps the prior client_secret_id unless client_secret is changing."
+	return "Keeps the prior client_secret_id unless client_secret or client_secret_wo is changing."
 }
 
 func (m clientSecretIDPlanModifier) MarkdownDescription(ctx context.Context) string {
@@ -64,15 +66,24 @@ func (m clientSecretIDPlanModifier) PlanModifyString(ctx context.Context, req pl
 	}
 
 	var stateSecret, planSecret types.String
+	var stateVersion, planVersion types.Int64
 	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("client_secret"), &stateSecret)...)
 	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("client_secret"), &planSecret)...)
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("client_secret_wo_version"), &stateVersion)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("client_secret_wo_version"), &planVersion)...)
+	var woSecret types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("client_secret_wo"), &woSecret)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Mirrors the rotation condition in Update: a rotation only happens when
-	// the planned secret is known, set, and different from the stored one.
+	// Mirrors the rotation conditions in Update: a rotation only happens when
+	// the planned secret is known, set, and different from the stored one, or
+	// when a write-only secret is configured and its version changed.
 	rotating := !planSecret.IsNull() && !planSecret.IsUnknown() && !planSecret.Equal(stateSecret)
+	if !woSecret.IsNull() && !planVersion.Equal(stateVersion) {
+		rotating = true
+	}
 	if rotating {
 		return
 	}
@@ -99,6 +110,8 @@ type clientResourceModel struct {
 	FederatedIdentities                 types.List   `tfsdk:"federated_identities"`
 	ClientSecret                        types.String `tfsdk:"client_secret"`
 	ClientSecretID                      types.String `tfsdk:"client_secret_id"`
+	ClientSecretWO                      types.String `tfsdk:"client_secret_wo"`
+	ClientSecretWOVersion               types.Int64  `tfsdk:"client_secret_wo_version"`
 }
 
 // clientFederatedIdentityModel maps a single federated identity nested object.
@@ -167,6 +180,30 @@ func (r *clientResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"client_secret_wo": schema.StringAttribute{
+				Description: "Write-only client secret for non-public clients. The value is sent to Pocket ID but " +
+					"never stored in the plan or state. Requires Terraform 1.11 or later. Change " +
+					"client_secret_wo_version to rotate it. It must have at least a length of 16 and consist " +
+					"only of printable ASCII characters. Conflicts with client_secret.",
+				Optional:  true,
+				Sensitive: true,
+				WriteOnly: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(16), // Matches the API binding (min=16)
+					stringvalidator.RegexMatches(
+						regexp.MustCompile(`^[\x20-\x7E]+$`),
+						"Client secret must contain only printable ASCII characters",
+					),
+				},
+			},
+			"client_secret_wo_version": schema.Int64Attribute{
+				Description: "Version of client_secret_wo. Because a write-only value is not stored, " +
+					"changing this number is the only way to rotate the secret. Requires client_secret_wo.",
+				Optional: true,
+				Validators: []validator.Int64{
+					int64validator.AtLeast(0),
 				},
 			},
 			"client_secret_id": schema.StringAttribute{
@@ -324,6 +361,47 @@ func (r *clientResource) ValidateConfig(ctx context.Context, req resource.Valida
 			"client_secret can only be set for confidential clients. Set is_public = false to use a custom client secret.",
 		)
 	}
+
+	if config.IsPublic.ValueBool() && !config.ClientSecretWO.IsNull() && !config.ClientSecretWO.IsUnknown() {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("client_secret_wo"),
+			"Invalid client secret configuration",
+			"client_secret_wo can only be set for confidential clients. Set is_public = false to use a custom client secret.",
+		)
+	}
+
+	if !config.ClientSecretWO.IsNull() && !config.ClientSecret.IsNull() {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("client_secret_wo"),
+			"Conflicting client secret configuration",
+			"client_secret_wo cannot be set together with client_secret.",
+		)
+	}
+
+	if !config.ClientSecretWOVersion.IsNull() && config.ClientSecretWO.IsNull() {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("client_secret_wo_version"),
+			"Invalid client secret configuration",
+			"client_secret_wo_version requires client_secret_wo to be set.",
+		)
+	}
+}
+
+// ModifyPlan plans client_secret as null when client_secret_wo supplies the
+// secret. UseStateForUnknown does not carry a null state value forward, so
+// without this the attribute would be "known after apply" on every plan.
+func (r *clientResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var woSecret types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("client_secret_wo"), &woSecret)...)
+	if resp.Diagnostics.HasError() || woSecret.IsNull() {
+		return
+	}
+
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("client_secret"), types.StringNull())...)
 }
 
 // Create creates the resource and sets the initial Terraform state.
@@ -336,9 +414,16 @@ func (r *clientResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	// Write-only values are not part of the plan, so read them from config.
+	var woSecret types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("client_secret_wo"), &woSecret)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// Check version compatibility before making any API calls.
-	if !plan.IsPublic.ValueBool() && !plan.ClientSecret.IsNull() && !plan.ClientSecret.IsUnknown() {
-		if err := r.client.RequireMinVersion("setting a custom client_secret", client.MinVersionCustomClientSecret); err != nil {
+	if !plan.IsPublic.ValueBool() && (!woSecret.IsNull() || (!plan.ClientSecret.IsNull() && !plan.ClientSecret.IsUnknown())) {
+		if err := r.client.RequireMinVersion("setting a custom client secret", client.MinVersionCustomClientSecret); err != nil {
 			resp.Diagnostics.AddAttributeError(
 				path.Root("client_secret"),
 				"Pocket ID version too old",
@@ -404,7 +489,9 @@ func (r *clientResource) Create(ctx context.Context, req resource.CreateRequest,
 	// Generate client secret for non-public clients
 	if !plan.IsPublic.ValueBool() {
 		var customSecret string
-		if !plan.ClientSecret.IsNull() && !plan.ClientSecret.IsUnknown() {
+		if !woSecret.IsNull() {
+			customSecret = woSecret.ValueString()
+		} else if !plan.ClientSecret.IsNull() && !plan.ClientSecret.IsUnknown() {
 			customSecret = plan.ClientSecret.ValueString()
 		}
 		tflog.Debug(ctx, "Generating client secret for non-public client")
@@ -430,7 +517,12 @@ func (r *clientResource) Create(ctx context.Context, req resource.CreateRequest,
 				return
 			}
 		}
-		plan.ClientSecret = types.StringValue(secret.Secret)
+		if woSecret.IsNull() {
+			plan.ClientSecret = types.StringValue(secret.Secret)
+		} else {
+			// The write-only value must never reach state.
+			plan.ClientSecret = types.StringNull()
+		}
 		plan.ClientSecretID = types.StringValue(secret.ID)
 	} else {
 		plan.ClientSecret = types.StringNull()
@@ -780,12 +872,21 @@ func (r *clientResource) Update(ctx context.Context, req resource.UpdateRequest,
 		}
 	}
 
+	// Write-only values are not part of the plan or state, so read them from
+	// config. The version is the only rotation trigger for them.
+	var woSecret types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("client_secret_wo"), &woSecret)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	rotateWO := !woSecret.IsNull() && !plan.ClientSecretWOVersion.Equal(state.ClientSecretWOVersion)
+
 	// The client secret cannot be retrieved after creation, so preserve the
 	// value from state by default. If the user configures a new value, rotate
 	// the secret via the API.
-	if !plan.ClientSecret.IsNull() && !plan.ClientSecret.IsUnknown() &&
-		plan.ClientSecret.ValueString() != state.ClientSecret.ValueString() {
-		if err := r.client.RequireMinVersion("setting a custom client_secret", client.MinVersionCustomClientSecret); err != nil {
+	if rotateWO || (!plan.ClientSecret.IsNull() && !plan.ClientSecret.IsUnknown() &&
+		plan.ClientSecret.ValueString() != state.ClientSecret.ValueString()) {
+		if err := r.client.RequireMinVersion("setting a custom client secret", client.MinVersionCustomClientSecret); err != nil {
 			resp.Diagnostics.AddAttributeError(
 				path.Root("client_secret"),
 				"Pocket ID version too old",
@@ -796,7 +897,11 @@ func (r *clientResource) Update(ctx context.Context, req resource.UpdateRequest,
 		tflog.Debug(ctx, "Rotating client secret", map[string]any{
 			"id": plan.ID.ValueString(),
 		})
-		secret, err := r.client.GenerateClientSecret(plan.ID.ValueString(), plan.ClientSecret.ValueString())
+		newSecret := plan.ClientSecret.ValueString()
+		if rotateWO {
+			newSecret = woSecret.ValueString()
+		}
+		secret, err := r.client.GenerateClientSecret(plan.ID.ValueString(), newSecret)
 		if err != nil {
 			resp.Diagnostics.AddError(
 				"Error updating client secret",
@@ -804,7 +909,12 @@ func (r *clientResource) Update(ctx context.Context, req resource.UpdateRequest,
 			)
 			return
 		}
-		plan.ClientSecret = types.StringValue(secret.Secret)
+		if rotateWO {
+			// The write-only value must never reach state.
+			plan.ClientSecret = types.StringNull()
+		} else {
+			plan.ClientSecret = types.StringValue(secret.Secret)
+		}
 		plan.ClientSecretID = types.StringValue(secret.ID)
 
 		// The new secret is live at this point. Revoke the one it replaced, so

@@ -40,6 +40,18 @@ func TestClientResource_Schema(t *testing.T) {
 	assert.True(t, clientSecretAttr.IsComputed(), "client_secret should be computed")
 	assert.True(t, clientSecretAttr.IsSensitive(), "client_secret should be sensitive")
 
+	clientSecretWOAttr, ok := schemaResponse.Schema.Attributes["client_secret_wo"]
+	assert.True(t, ok, "client_secret_wo attribute should exist")
+	assert.True(t, clientSecretWOAttr.IsOptional(), "client_secret_wo should be optional")
+	assert.False(t, clientSecretWOAttr.IsComputed(), "client_secret_wo should not be computed")
+	assert.True(t, clientSecretWOAttr.IsSensitive(), "client_secret_wo should be sensitive")
+	assert.True(t, clientSecretWOAttr.IsWriteOnly(), "client_secret_wo should be write-only")
+
+	clientSecretWOVersionAttr, ok := schemaResponse.Schema.Attributes["client_secret_wo_version"]
+	assert.True(t, ok, "client_secret_wo_version attribute should exist")
+	assert.True(t, clientSecretWOVersionAttr.IsOptional(), "client_secret_wo_version should be optional")
+	assert.False(t, clientSecretWOVersionAttr.IsWriteOnly(), "client_secret_wo_version must be stored in state")
+
 	// Verify optional attributes with defaults
 	isPublicAttr, ok := schemaResponse.Schema.Attributes["is_public"]
 	assert.True(t, ok, "is_public attribute should exist")

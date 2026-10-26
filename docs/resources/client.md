@@ -187,9 +187,13 @@ output "spa_client_id" {
 
 ### Optional
 
+> **NOTE**: [Write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments) are supported in Terraform 1.11 and later.
+
 - `allowed_user_groups` (Set of String) Set of user group IDs that are allowed to use this client. If empty, all users can use this client.
 - `client_id` (String) The client ID to use for the OIDC client. If not set, one will be generated. Must be between 2 and 128 characters.
 - `client_secret` (String, Sensitive) The client secret for non-public clients. Only available during resource creation for non-public clients.When specified, it must have at least a length of 16 and consist only of printable ASCII characters.It is recommended to leave this empty and let Pocket ID automatically generate a secret.
+- `client_secret_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only client secret for non-public clients. The value is sent to Pocket ID but never stored in the plan or state. Requires Terraform 1.11 or later. Change client_secret_wo_version to rotate it. It must have at least a length of 16 and consist only of printable ASCII characters. Conflicts with client_secret.
+- `client_secret_wo_version` (Number) Version of client_secret_wo. Because a write-only value is not stored, changing this number is the only way to rotate the secret. Requires client_secret_wo.
 - `dark_logo_url` (String) URL of the client's dark-mode logo, downloaded by Pocket ID. When not set, a logo added outside Terraform is left untouched; removing a URL that Terraform set deletes the logo.
 - `federated_identities` (Attributes List) List of federated identities (workload identity federation) allowed to authenticate as this client. (see [below for nested schema](#nestedatt--federated_identities))
 - `is_public` (Boolean) Whether this is a public client (no client secret). Defaults to false.
